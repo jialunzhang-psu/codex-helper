@@ -23,10 +23,11 @@ Main commands:
 - `cargo run -- list --unnamed`
 - `cargo run -- add-resume <SESSION_ID>`
 - `cargo run -- add-resume <SESSION_ID> --name "Custom title"`
-- `cargo run -- clean --id <SESSION_ID> --dry-run`
-- `cargo run -- clean --name "partial or exact name" --dry-run`
-- `cargo run -- clean --unnamed --dry-run`
-- `cargo run -- clean-not-in-resume --dry-run`
+- `cargo run -- clean --pick`
+- `cargo run -- clean --id <SESSION_ID>`
+- `cargo run -- clean --name "partial or exact name"`
+- `cargo run -- clean --unnamed`
+- `cargo run -- clean-not-in-resume`
 
 All commands also accept:
 
@@ -38,7 +39,7 @@ If you want a compiled binary instead of `cargo run`:
 
 ```bash
 cargo build --release
-./target/release/codex_helper --help
+./target/release/codex-helper --help
 ```
 
 ## How Sessions Are Collected
@@ -68,8 +69,8 @@ The displayed session name is chosen in this order:
 
 The tool treats a session as "unnamed" if its name is empty, `(untitled)`, or still matches the auto-generated first user message rather than a user-assigned title.
 
+`clean --pick` opens an interactive selector that lists sessions with row numbers. You can enter values like `1 3 5-8`, review the chosen sessions, and then type `DELETE` to confirm removal.
+
 ## Codex Version
 
 It works with codex-cli 0.116.0.
-```
-

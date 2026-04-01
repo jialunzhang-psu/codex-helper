@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -67,21 +67,18 @@ struct AddResumeArgs {
 
 #[derive(Args, Debug)]
 struct CleanArgs {
-    #[arg(long, conflicts_with_all = ["name", "unnamed"])]
+    #[arg(long, conflicts_with_all = ["name", "unnamed", "pick"])]
     id: Option<String>,
-    #[arg(long, conflicts_with_all = ["id", "unnamed"])]
+    #[arg(long, conflicts_with_all = ["id", "unnamed", "pick"])]
     name: Option<String>,
-    #[arg(long, conflicts_with_all = ["id", "name"])]
+    #[arg(long, conflicts_with_all = ["id", "name", "pick"])]
     unnamed: bool,
-    #[arg(long)]
-    dry_run: bool,
+    #[arg(long, conflicts_with_all = ["id", "name", "unnamed"])]
+    pick: bool,
 }
 
 #[derive(Args, Debug)]
-struct CleanNotInResumeArgs {
-    #[arg(long)]
-    dry_run: bool,
-}
+struct CleanNotInResumeArgs {}
 
 #[derive(Args, Debug)]
 struct ListArgs {
@@ -220,19 +217,24 @@ impl Store {
                 .filter(|session| session_is_unnamed(session))
                 .map(|session| session.id.clone())
                 .collect()
+        } else if args.pick {
+            self.pick_sessions(&sessions)?
         } else {
-            bail!("pass either --id, --name, or --unnamed");
+            bail!("pass either --id, --name, --unnamed, or --pick");
         };
 
         if args.unnamed && target_ids.is_empty() {
             println!("no unnamed sessions found");
             return Ok(());
         }
+        if args.pick && target_ids.is_empty() {
+            return Ok(());
+        }
 
-        self.clean_ids(&target_ids, args.dry_run)
+        self.clean_ids(&target_ids)
     }
 
-    fn clean_not_in_resume(&self, args: &CleanNotInResumeArgs) -> Result<()> {
+    fn clean_not_in_resume(&self, _args: &CleanNotInResumeArgs) -> Result<()> {
         self.ensure_state_db_available("read the resume list")?;
         let sessions = self.load_sessions()?;
         let target_ids: Vec<String> = sessions
@@ -246,10 +248,10 @@ impl Store {
             return Ok(());
         }
 
-        self.clean_ids(&target_ids, args.dry_run)
+        self.clean_ids(&target_ids)
     }
 
-    fn clean_ids(&self, target_ids: &[String], dry_run: bool) -> Result<()> {
+    fn clean_ids(&self, target_ids: &[String]) -> Result<()> {
         let target_set: HashSet<&str> = target_ids.iter().map(String::as_str).collect();
         let sessions = self.load_sessions()?;
         let victims: Vec<SessionInfo> = sessions
@@ -264,16 +266,11 @@ impl Store {
 
         for session in &victims {
             println!(
-                "{} {}\t{}\t{}",
-                if dry_run { "would_remove" } else { "remove" },
+                "remove {}\t{}\t{}",
                 session.id,
                 session.display_name,
                 session.cwd.display()
             );
-        }
-
-        if dry_run {
-            return Ok(());
         }
 
         for session in &victims {
@@ -693,6 +690,70 @@ impl Store {
         Err(ambiguous_name_error(query, &contains))
     }
 
+    fn pick_sessions(&self, sessions: &[SessionInfo]) -> Result<Vec<String>> {
+        if sessions.is_empty() {
+            println!("no sessions found");
+            return Ok(Vec::new());
+        }
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            bail!("--pick requires an interactive terminal");
+        }
+
+        println!("NUM\tIN_RESUME\tSESSION_ID\tNAME\tCWD");
+        for (index, session) in sessions.iter().enumerate() {
+            let in_resume = if session.in_resume { "yes" } else { "no" };
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                index + 1,
+                in_resume,
+                session.id,
+                session.display_name,
+                session.cwd.display()
+            );
+        }
+
+        let selected_indexes = loop {
+            let input = prompt_line(
+                "Select sessions to remove by number (for example: 1 3 5-8). Press Enter to cancel: ",
+            )?;
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                println!("selection cancelled");
+                return Ok(Vec::new());
+            }
+
+            match parse_pick_selection(trimmed, sessions.len()) {
+                Ok(indexes) => break indexes,
+                Err(error) => eprintln!("invalid selection: {error:#}"),
+            }
+        };
+
+        println!("selected sessions:");
+        for index in &selected_indexes {
+            let session = &sessions[*index - 1];
+            println!(
+                "{}\t{}\t{}\t{}",
+                index,
+                session.id,
+                session.display_name,
+                session.cwd.display()
+            );
+        }
+
+        let confirmation = prompt_line(
+            "Type DELETE to remove these sessions, or press Enter to cancel: ",
+        )?;
+        if confirmation.trim() != "DELETE" {
+            println!("deletion cancelled");
+            return Ok(Vec::new());
+        }
+
+        Ok(selected_indexes
+            .into_iter()
+            .map(|index| sessions[index - 1].id.clone())
+            .collect())
+    }
+
     fn open_state_db(&self) -> Result<Option<Connection>> {
         let Some(path) = &self.state_db_path else {
             return Ok(None);
@@ -906,6 +967,71 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or(text).trim()
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    let mut stdout = io::stdout();
+    stdout.write_all(prompt.as_bytes())?;
+    stdout.flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input)
+}
+
+fn parse_pick_selection(input: &str, max: usize) -> Result<Vec<usize>> {
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+
+    if input.eq_ignore_ascii_case("all") || input == "*" {
+        return Ok((1..=max).collect());
+    }
+
+    let mut selected = HashSet::new();
+    for token in input.split(|ch: char| ch == ',' || ch.is_whitespace()) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        if let Some((start, end)) = token.split_once('-') {
+            let start = parse_pick_index(start.trim(), max)?;
+            let end = parse_pick_index(end.trim(), max)?;
+            let (from, to) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            for index in from..=to {
+                selected.insert(index);
+            }
+            continue;
+        }
+
+        selected.insert(parse_pick_index(token, max)?);
+    }
+
+    if selected.is_empty() {
+        bail!("no valid session numbers were provided");
+    }
+
+    let mut indexes: Vec<usize> = selected.into_iter().collect();
+    indexes.sort_unstable();
+    Ok(indexes)
+}
+
+fn parse_pick_index(token: &str, max: usize) -> Result<usize> {
+    let index: usize = token
+        .parse()
+        .with_context(|| format!("invalid session number {token:?}"))?;
+    if index == 0 {
+        bail!("session numbers start at 1");
+    }
+    if index > max {
+        bail!("session number {index} is out of range 1..={max}");
+    }
+    Ok(index)
 }
 
 fn normalize_display_name(text: &str) -> Option<String> {
@@ -1161,8 +1287,8 @@ fn find_latest_state_db(codex_home: &Path) -> Result<Option<PathBuf>> {
 mod tests {
     use super::{
         ListFilter, SessionInfo, UNTITLED_SESSION_NAME, extract_title_candidate,
-        find_latest_state_db, parse_timestamp_to_epoch_seconds, refresh_display_name,
-        session_is_unnamed, session_matches_list_filter, truncate_chars,
+        find_latest_state_db, parse_pick_selection, parse_timestamp_to_epoch_seconds,
+        refresh_display_name, session_is_unnamed, session_matches_list_filter, truncate_chars,
     };
     use serde_json::json;
     use std::collections::HashSet;
@@ -1385,5 +1511,23 @@ mod tests {
         session.derived_name = None;
         refresh_display_name(&mut session);
         assert_eq!(session.display_name, "first user message");
+    }
+
+    #[test]
+    fn parse_pick_selection_accepts_individual_indexes_and_ranges() {
+        let indexes = parse_pick_selection("1 3,5-7", 8).unwrap();
+        assert_eq!(indexes, vec![1, 3, 5, 6, 7]);
+    }
+
+    #[test]
+    fn parse_pick_selection_accepts_all_keyword() {
+        let indexes = parse_pick_selection("all", 4).unwrap();
+        assert_eq!(indexes, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn parse_pick_selection_rejects_out_of_range_values() {
+        let error = parse_pick_selection("1 9", 8).unwrap_err().to_string();
+        assert!(error.contains("out of range"));
     }
 }
