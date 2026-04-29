@@ -29,10 +29,9 @@ fn run() -> Result<()> {
     let store = Store::new(cli.codex_home)?;
 
     match cli.command {
-        Command::AddResume(args) => store.add_resume(&args),
-        Command::Clean(args) => store.clean(&args),
-        Command::CleanNotInResume(args) => store.clean_not_in_resume(&args),
         Command::List(args) => store.list_sessions(&args),
+        Command::Remove(args) => store.remove_sessions(&args),
+        Command::Restore(args) => store.add_resume(&args),
     }
 }
 
@@ -40,7 +39,7 @@ fn run() -> Result<()> {
 #[command(
     author,
     version,
-    about = "Manage local Codex sessions stored under ~/.codex"
+    about = "Inspect, filter, restore, and remove local Codex sessions"
 )]
 struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
@@ -51,41 +50,70 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    AddResume(AddResumeArgs),
-    Clean(CleanArgs),
-    #[command(name = "clean-not-in-resume", visible_alias = "clean-unindexed")]
-    CleanNotInResume(CleanNotInResumeArgs),
+    #[command(visible_alias = "ls")]
     List(ListArgs),
+    #[command(visible_alias = "rm", visible_alias = "clean")]
+    Remove(RemoveArgs),
+    #[command(visible_alias = "resume", visible_alias = "add-resume")]
+    Restore(AddResumeArgs),
 }
 
 #[derive(Args, Debug)]
 struct AddResumeArgs {
+    #[arg(value_name = "SESSION_ID")]
     session_id: String,
-    #[arg(long)]
+    #[arg(long, value_name = "TITLE")]
     name: Option<String>,
 }
 
 #[derive(Args, Debug)]
-struct CleanArgs {
-    #[arg(long, conflicts_with_all = ["name", "unnamed", "pick"])]
+struct SessionFilterArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Only include sessions whose workspace matches this file or directory path"
+    )]
+    path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct RemoveArgs {
+    #[command(flatten)]
+    filter: SessionFilterArgs,
+    #[arg(long, conflicts_with_all = ["name", "unnamed", "not_in_resume", "pick"])]
     id: Option<String>,
-    #[arg(long, conflicts_with_all = ["id", "unnamed", "pick"])]
+    #[arg(long, value_name = "TEXT", conflicts_with_all = ["id", "unnamed", "not_in_resume", "pick"])]
     name: Option<String>,
-    #[arg(long, conflicts_with_all = ["id", "name", "pick"])]
+    #[arg(long, conflicts_with_all = ["id", "name", "not_in_resume", "pick"])]
     unnamed: bool,
-    #[arg(long, conflicts_with_all = ["id", "name", "unnamed"])]
+    #[arg(long, conflicts_with_all = ["id", "name", "unnamed", "pick"])]
+    not_in_resume: bool,
+    #[arg(long, conflicts_with_all = ["id", "name", "unnamed", "not_in_resume"])]
     pick: bool,
+    #[arg(
+        long,
+        short = 'y',
+        help = "Delete without interactive confirmation after printing the matched sessions"
+    )]
+    yes: bool,
 }
-
-#[derive(Args, Debug)]
-struct CleanNotInResumeArgs {}
 
 #[derive(Args, Debug)]
 struct ListArgs {
+    #[command(flatten)]
+    filter: SessionFilterArgs,
     #[arg(long, conflicts_with = "named")]
     unnamed: bool,
     #[arg(long, conflicts_with = "unnamed")]
     named: bool,
+    #[arg(long, conflicts_with = "archived")]
+    active: bool,
+    #[arg(long, conflicts_with = "active")]
+    archived: bool,
+    #[arg(long, conflicts_with = "not_in_resume")]
+    in_resume: bool,
+    #[arg(long, conflicts_with = "in_resume")]
+    not_in_resume: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,9 +123,28 @@ enum ListFilter {
     Unnamed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveFilter {
+    All,
+    ActiveOnly,
+    ArchivedOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionScope {
+    mode: SessionScopeMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SessionScopeMode {
+    ProjectRoot(PathBuf),
+    ExactDirectory(PathBuf),
+}
+
 struct Store {
     _codex_home: PathBuf,
     sessions_root: PathBuf,
+    archived_sessions_root: PathBuf,
     session_index_path: PathBuf,
     history_path: PathBuf,
     state_db_path: Option<PathBuf>,
@@ -116,6 +163,7 @@ impl Store {
         let state_db_path = find_latest_state_db(&root)?;
         Ok(Self {
             sessions_root: root.join("sessions"),
+            archived_sessions_root: root.join("archived_sessions"),
             session_index_path: root.join("session_index.jsonl"),
             history_path: root.join("history.jsonl"),
             _codex_home: root,
@@ -124,25 +172,28 @@ impl Store {
     }
 
     fn list_sessions(&self, args: &ListArgs) -> Result<()> {
+        let scope = session_scope_from_args(&args.filter)?;
         let filter = list_filter_from_args(args);
+        let archive_filter = archive_filter_from_args(args.active, args.archived);
         let sessions: Vec<SessionInfo> = self
             .load_sessions()?
             .into_iter()
+            .filter(|session| session_matches_scope(scope.as_ref(), session))
             .filter(|session| session_matches_list_filter(filter, session))
+            .filter(|session| session_matches_archive_filter(archive_filter, session))
+            .filter(|session| !args.in_resume || session.in_resume)
+            .filter(|session| !args.not_in_resume || !session.in_resume)
             .collect();
-        if filter == ListFilter::Unnamed && sessions.is_empty() {
-            println!("no unnamed sessions found");
+        if sessions.is_empty() {
+            println!("no sessions found");
             return Ok(());
         }
-        if filter == ListFilter::Named && sessions.is_empty() {
-            println!("no named sessions found");
-            return Ok(());
-        }
-        println!("IN_RESUME\tSESSION_ID\tNAME\tCWD");
+        println!("IN_RESUME\tARCHIVED\tSESSION_ID\tNAME\tCWD");
         for session in sessions {
             let in_resume = if session.in_resume { "yes" } else { "no" };
+            let archived = if session.archived { "yes" } else { "no" };
             println!(
-                "{in_resume}\t{}\t{}\t{}",
+                "{in_resume}\t{archived}\t{}\t{}\t{}",
                 session.id,
                 session.display_name,
                 session.cwd.display()
@@ -198,8 +249,13 @@ impl Store {
         Ok(())
     }
 
-    fn clean(&self, args: &CleanArgs) -> Result<()> {
-        let sessions = self.load_sessions()?;
+    fn remove_sessions(&self, args: &RemoveArgs) -> Result<()> {
+        let scope = session_scope_from_args(&args.filter)?;
+        let sessions: Vec<SessionInfo> = self
+            .load_sessions()?
+            .into_iter()
+            .filter(|session| session_matches_scope(scope.as_ref(), session))
+            .collect();
         let target_ids = if let Some(id) = &args.id {
             let session = sessions
                 .iter()
@@ -217,41 +273,34 @@ impl Store {
                 .filter(|session| session_is_unnamed(session))
                 .map(|session| session.id.clone())
                 .collect()
+        } else if args.not_in_resume {
+            sessions
+                .iter()
+                .filter(|session| !session.in_resume)
+                .map(|session| session.id.clone())
+                .collect()
         } else if args.pick {
             self.pick_sessions(&sessions)?
         } else {
-            bail!("pass either --id, --name, --unnamed, or --pick");
+            bail!("choose one selector: --id, --name, --unnamed, --not-in-resume, or --pick");
         };
 
         if args.unnamed && target_ids.is_empty() {
             println!("no unnamed sessions found");
             return Ok(());
         }
+        if args.not_in_resume && target_ids.is_empty() {
+            println!("no sessions outside the resume list found");
+            return Ok(());
+        }
         if args.pick && target_ids.is_empty() {
             return Ok(());
         }
 
-        self.clean_ids(&target_ids)
+        self.clean_ids(&target_ids, args.yes)
     }
 
-    fn clean_not_in_resume(&self, _args: &CleanNotInResumeArgs) -> Result<()> {
-        self.ensure_state_db_available("read the resume list")?;
-        let sessions = self.load_sessions()?;
-        let target_ids: Vec<String> = sessions
-            .into_iter()
-            .filter(|session| !session.in_resume)
-            .map(|session| session.id)
-            .collect();
-
-        if target_ids.is_empty() {
-            println!("no sessions outside the resume list found");
-            return Ok(());
-        }
-
-        self.clean_ids(&target_ids)
-    }
-
-    fn clean_ids(&self, target_ids: &[String]) -> Result<()> {
+    fn clean_ids(&self, target_ids: &[String], assume_yes: bool) -> Result<()> {
         let target_set: HashSet<&str> = target_ids.iter().map(String::as_str).collect();
         let sessions = self.load_sessions()?;
         let victims: Vec<SessionInfo> = sessions
@@ -266,11 +315,21 @@ impl Store {
 
         for session in &victims {
             println!(
-                "remove {}\t{}\t{}",
+                "remove {}\t{}\t{}\t{}",
                 session.id,
                 session.display_name,
+                if session.archived {
+                    "archived"
+                } else {
+                    "active"
+                },
                 session.cwd.display()
             );
+        }
+
+        if !confirm_removal(&victims, assume_yes)? {
+            println!("deletion cancelled");
+            return Ok(());
         }
 
         for session in &victims {
@@ -278,7 +337,9 @@ impl Store {
                 if path.exists() {
                     fs::remove_file(path)
                         .with_context(|| format!("failed to remove {}", path.display()))?;
-                    prune_empty_parents(path, &self.sessions_root)?;
+                    if let Some(stop_at) = self.prune_stop_root(path) {
+                        prune_empty_parents(path, stop_at)?;
+                    }
                 }
             }
         }
@@ -304,26 +365,31 @@ impl Store {
         let db_threads = self.load_state_threads()?;
         let mut sessions_by_id: HashMap<String, SessionInfo> = HashMap::new();
 
-        for entry in WalkDir::new(&self.sessions_root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            if entry.path().extension() != Some(OsStr::new("jsonl")) {
+        for root in [&self.sessions_root, &self.archived_sessions_root] {
+            if !root.exists() {
                 continue;
             }
-            match self.load_session_file(entry.path()) {
-                Ok(session) => {
-                    sessions_by_id
-                        .entry(session.id.clone())
-                        .and_modify(|existing| merge_sessions(existing, &session))
-                        .or_insert(session);
+            for entry in WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+            {
+                if entry.path().extension() != Some(OsStr::new("jsonl")) {
+                    continue;
                 }
-                Err(error) => {
-                    eprintln!(
-                        "warning: failed to parse {}: {error:#}",
-                        entry.path().display()
-                    );
+                match self.load_session_file(entry.path()) {
+                    Ok(session) => {
+                        sessions_by_id
+                            .entry(session.id.clone())
+                            .and_modify(|existing| merge_sessions(existing, &session))
+                            .or_insert(session);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: failed to parse {}: {error:#}",
+                            entry.path().display()
+                        );
+                    }
                 }
             }
         }
@@ -336,17 +402,15 @@ impl Store {
         }
 
         for (id, entry) in &index_entries {
-            let session = sessions_by_id
-                .entry(id.clone())
-                .or_insert_with(|| SessionInfo::placeholder(id));
-            apply_index_entry(session, entry);
+            if let Some(session) = sessions_by_id.get_mut(id) {
+                apply_index_entry(session, entry);
+            }
         }
 
         for (id, entry) in &history_sessions {
-            let session = sessions_by_id
-                .entry(id.clone())
-                .or_insert_with(|| SessionInfo::placeholder(id));
-            apply_history_entry(session, entry);
+            if let Some(session) = sessions_by_id.get_mut(id) {
+                apply_history_entry(session, entry);
+            }
         }
 
         let mut sessions: Vec<SessionInfo> = sessions_by_id.into_values().collect();
@@ -450,6 +514,9 @@ impl Store {
         let display_name = derived_name
             .clone()
             .unwrap_or_else(|| UNTITLED_SESSION_NAME.to_string());
+        let archived = path
+            .ancestors()
+            .any(|ancestor| ancestor.file_name() == Some(OsStr::new("archived_sessions")));
 
         Ok(SessionInfo {
             id,
@@ -458,6 +525,7 @@ impl Store {
             cwd,
             timestamp,
             in_resume: false,
+            archived,
             indexed_name: None,
             state_title: None,
             derived_name,
@@ -651,13 +719,39 @@ impl Store {
             return Ok(());
         };
         let mut delete_thread_stmt = connection.prepare("DELETE FROM threads WHERE id = ?1")?;
-        let mut delete_tools_stmt =
-            connection.prepare("DELETE FROM thread_dynamic_tools WHERE thread_id = ?1")?;
+        let mut delete_tools_stmt = if sqlite_table_exists(&connection, "thread_dynamic_tools")? {
+            Some(connection.prepare("DELETE FROM thread_dynamic_tools WHERE thread_id = ?1")?)
+        } else {
+            None
+        };
+        let mut delete_spawn_edges_stmt = if sqlite_table_exists(&connection, "thread_spawn_edges")?
+        {
+            Some(connection.prepare(
+                "DELETE FROM thread_spawn_edges WHERE child_thread_id = ?1 OR parent_thread_id = ?1",
+            )?)
+        } else {
+            None
+        };
         for session_id in target_ids {
+            if let Some(stmt) = delete_tools_stmt.as_mut() {
+                stmt.execute(params![session_id])?;
+            }
+            if let Some(stmt) = delete_spawn_edges_stmt.as_mut() {
+                stmt.execute(params![session_id])?;
+            }
             delete_thread_stmt.execute(params![session_id])?;
-            delete_tools_stmt.execute(params![session_id])?;
         }
         Ok(())
+    }
+
+    fn prune_stop_root<'a>(&'a self, path: &Path) -> Option<&'a Path> {
+        if path.starts_with(&self.sessions_root) {
+            return Some(self.sessions_root.as_path());
+        }
+        if path.starts_with(&self.archived_sessions_root) {
+            return Some(self.archived_sessions_root.as_path());
+        }
+        None
     }
 
     fn resolve_name_matches<'a>(
@@ -699,13 +793,15 @@ impl Store {
             bail!("--pick requires an interactive terminal");
         }
 
-        println!("NUM\tIN_RESUME\tSESSION_ID\tNAME\tCWD");
+        println!("NUM\tIN_RESUME\tARCHIVED\tSESSION_ID\tNAME\tCWD");
         for (index, session) in sessions.iter().enumerate() {
             let in_resume = if session.in_resume { "yes" } else { "no" };
+            let archived = if session.archived { "yes" } else { "no" };
             println!(
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 index + 1,
                 in_resume,
+                archived,
                 session.id,
                 session.display_name,
                 session.cwd.display()
@@ -738,14 +834,6 @@ impl Store {
                 session.display_name,
                 session.cwd.display()
             );
-        }
-
-        let confirmation = prompt_line(
-            "Type DELETE to remove these sessions, or press Enter to cancel: ",
-        )?;
-        if confirmation.trim() != "DELETE" {
-            println!("deletion cancelled");
-            return Ok(Vec::new());
         }
 
         Ok(selected_indexes
@@ -825,6 +913,7 @@ struct SessionInfo {
     cwd: PathBuf,
     timestamp: Option<String>,
     in_resume: bool,
+    archived: bool,
     indexed_name: Option<String>,
     state_title: Option<String>,
     derived_name: Option<String>,
@@ -846,6 +935,7 @@ impl SessionInfo {
             cwd: PathBuf::from("(unknown)"),
             timestamp: None,
             in_resume: false,
+            archived: false,
             indexed_name: None,
             state_title: None,
             derived_name: None,
@@ -1034,6 +1124,115 @@ fn parse_pick_index(token: &str, max: usize) -> Result<usize> {
     Ok(index)
 }
 
+fn session_scope_from_args(args: &SessionFilterArgs) -> Result<Option<SessionScope>> {
+    args.path.as_deref().map(resolve_session_scope).transpose()
+}
+
+fn resolve_session_scope(path: &Path) -> Result<SessionScope> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(path)
+    };
+    let metadata = fs::metadata(&absolute)
+        .with_context(|| format!("path does not exist: {}", absolute.display()))?;
+    let scope_root = if metadata.is_dir() {
+        absolute
+    } else {
+        absolute
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow!("file path has no parent: {}", path.display()))?
+    };
+    let mode = if let Some(workspace_root) = find_workspace_root(&scope_root) {
+        let canonical = fs::canonicalize(&workspace_root)
+            .with_context(|| format!("failed to resolve {}", workspace_root.display()))?;
+        SessionScopeMode::ProjectRoot(canonical)
+    } else {
+        let canonical = fs::canonicalize(&scope_root)
+            .with_context(|| format!("failed to resolve {}", scope_root.display()))?;
+        SessionScopeMode::ExactDirectory(canonical)
+    };
+    Ok(SessionScope { mode })
+}
+
+fn session_matches_scope(scope: Option<&SessionScope>, session: &SessionInfo) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let cwd = canonicalize_for_matching(&session.cwd);
+    match &scope.mode {
+        SessionScopeMode::ProjectRoot(root) => find_workspace_root(&cwd)
+            .map(|session_root| canonicalize_for_matching(&session_root) == *root)
+            .unwrap_or(false),
+        SessionScopeMode::ExactDirectory(dir) => cwd == *dir,
+    }
+}
+
+fn canonicalize_for_matching(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn find_workspace_root(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if has_workspace_marker(ancestor) {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn has_workspace_marker(path: &Path) -> bool {
+    [
+        ".git",
+        ".hg",
+        ".svn",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+    ]
+    .iter()
+    .any(|marker| path.join(marker).exists())
+}
+
+fn archive_filter_from_args(active_only: bool, archived_only: bool) -> ArchiveFilter {
+    if active_only {
+        ArchiveFilter::ActiveOnly
+    } else if archived_only {
+        ArchiveFilter::ArchivedOnly
+    } else {
+        ArchiveFilter::All
+    }
+}
+
+fn session_matches_archive_filter(filter: ArchiveFilter, session: &SessionInfo) -> bool {
+    match filter {
+        ArchiveFilter::All => true,
+        ArchiveFilter::ActiveOnly => !session.archived,
+        ArchiveFilter::ArchivedOnly => session.archived,
+    }
+}
+
+fn confirm_removal(victims: &[SessionInfo], assume_yes: bool) -> Result<bool> {
+    if victims.is_empty() {
+        return Ok(false);
+    }
+    if assume_yes {
+        return Ok(true);
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("removal requires confirmation; re-run with --yes in non-interactive mode");
+    }
+    println!();
+    println!("about to delete {} session(s)", victims.len());
+    let confirmation =
+        prompt_line("Type DELETE to remove these sessions, or press Enter to cancel: ")?;
+    Ok(confirmation.trim() == "DELETE")
+}
+
 fn normalize_display_name(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1112,12 +1311,12 @@ fn refresh_display_name(session: &mut SessionInfo) {
 
 fn preferred_name(session: &SessionInfo) -> Option<String> {
     session
-        .indexed_name
+        .state_title
         .as_deref()
         .and_then(normalize_display_name)
         .or_else(|| {
             session
-                .state_title
+                .indexed_name
                 .as_deref()
                 .and_then(normalize_display_name)
         })
@@ -1134,6 +1333,17 @@ fn preferred_name(session: &SessionInfo) -> Option<String> {
                 .and_then(normalize_display_name)
                 .map(|line| truncate_chars(&line, 80))
         })
+}
+
+fn sqlite_table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+            params![table_name],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(exists.is_some())
 }
 
 fn apply_index_entry(session: &mut SessionInfo, entry: &IndexEntry) {
@@ -1171,6 +1381,7 @@ fn merge_sessions(existing: &mut SessionInfo, incoming: &SessionInfo) {
     if existing.first_user_message.is_none() && incoming.first_user_message.is_some() {
         existing.first_user_message = incoming.first_user_message.clone();
     }
+    existing.archived &= incoming.archived;
 
     let incoming_newer = incoming.timestamp > existing.timestamp;
     if incoming_newer {
@@ -1183,6 +1394,7 @@ fn merge_sessions(existing: &mut SessionInfo, incoming: &SessionInfo) {
         existing.sandbox_policy = incoming.sandbox_policy.clone();
         existing.approval_mode = incoming.approval_mode.clone();
         existing.first_user_message = incoming.first_user_message.clone();
+        existing.archived = incoming.archived;
     }
 
     if existing.derived_name.is_none() && incoming.derived_name.is_some() {
@@ -1215,6 +1427,7 @@ fn apply_state_thread(session: &mut SessionInfo, db_thread: &StateThreadInfo) {
         session.first_user_message = Some(db_thread.first_user_message.clone());
     }
     session.in_resume = !db_thread.archived;
+    session.archived = db_thread.archived;
     refresh_display_name(session);
 }
 
@@ -1286,14 +1499,95 @@ fn find_latest_state_db(codex_home: &Path) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ListFilter, SessionInfo, UNTITLED_SESSION_NAME, extract_title_candidate,
-        find_latest_state_db, parse_pick_selection, parse_timestamp_to_epoch_seconds,
-        refresh_display_name, session_is_unnamed, session_matches_list_filter, truncate_chars,
+        ListFilter, SessionInfo, SessionScope, SessionScopeMode, Store, UNTITLED_SESSION_NAME,
+        extract_title_candidate, find_latest_state_db, parse_pick_selection,
+        parse_timestamp_to_epoch_seconds, refresh_display_name, resolve_session_scope,
+        session_is_unnamed, session_matches_list_filter, session_matches_scope, truncate_chars,
     };
+    use rusqlite::Connection;
     use serde_json::json;
     use std::collections::HashSet;
+    use std::env;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "codex-cleaner-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn write_rollout(root: &PathBuf, relative: &str, session_id: &str, cwd: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let contents = format!(
+            "{{\"timestamp\":\"2026-04-28T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"{cwd}\",\"timestamp\":\"2026-04-28T12:00:00.000Z\",\"source\":\"cli\",\"model_provider\":\"openai\",\"cli_version\":\"0.125.0\"}}}}\n\
+             {{\"timestamp\":\"2026-04-28T12:00:01.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"text\":\"hello from {session_id}\"}}]}}}}\n"
+        );
+        fs::write(path, contents).unwrap();
+    }
+
+    fn init_state_db(root: &PathBuf) -> PathBuf {
+        let db_path = root.join("state_5.sqlite");
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    model_provider TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    sandbox_policy TEXT NOT NULL,
+                    approval_mode TEXT NOT NULL,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    has_user_event INTEGER NOT NULL DEFAULT 0,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    archived_at INTEGER,
+                    git_sha TEXT,
+                    git_branch TEXT,
+                    git_origin_url TEXT,
+                    cli_version TEXT NOT NULL DEFAULT '',
+                    first_user_message TEXT NOT NULL DEFAULT '',
+                    agent_nickname TEXT,
+                    agent_role TEXT,
+                    memory_mode TEXT NOT NULL DEFAULT 'enabled',
+                    model TEXT,
+                    reasoning_effort TEXT,
+                    agent_path TEXT,
+                    created_at_ms INTEGER,
+                    updated_at_ms INTEGER
+                );
+                CREATE TABLE thread_dynamic_tools (
+                    thread_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    input_schema TEXT NOT NULL,
+                    namespace TEXT,
+                    defer_loading INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(thread_id, position)
+                );
+                CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL,
+                    child_thread_id TEXT NOT NULL PRIMARY KEY,
+                    status TEXT NOT NULL
+                );
+                ",
+            )
+            .unwrap();
+        db_path
+    }
 
     #[test]
     fn extracts_user_title_from_response_item() {
@@ -1328,7 +1622,7 @@ mod tests {
 
     #[test]
     fn picks_latest_state_db_version() {
-        let root = PathBuf::from("/tmp/codex-helper-state-db-test");
+        let root = PathBuf::from("/tmp/codex-cleaner-state-db-test");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("state_3.sqlite"), "").unwrap();
@@ -1350,6 +1644,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             timestamp: None,
             in_resume: false,
+            archived: false,
             indexed_name: None,
             state_title: None,
             derived_name: None,
@@ -1380,6 +1675,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             timestamp: None,
             in_resume: false,
+            archived: false,
             indexed_name: None,
             state_title: None,
             derived_name: None,
@@ -1410,6 +1706,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 timestamp: None,
                 in_resume: false,
+                archived: false,
                 indexed_name: None,
                 state_title: None,
                 derived_name: None,
@@ -1428,6 +1725,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 timestamp: None,
                 in_resume: true,
+                archived: false,
                 indexed_name: None,
                 state_title: None,
                 derived_name: None,
@@ -1446,6 +1744,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 timestamp: None,
                 in_resume: true,
+                archived: false,
                 indexed_name: None,
                 state_title: None,
                 derived_name: None,
@@ -1486,6 +1785,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             timestamp: None,
             in_resume: false,
+            archived: false,
             indexed_name: Some(" index\tname \nsecond line".to_string()),
             state_title: Some(" state title \nsecond line".to_string()),
             derived_name: Some(" derived\tname ".to_string()),
@@ -1498,13 +1798,13 @@ mod tests {
             first_user_message: Some(" first user message \nsecond line".to_string()),
         };
         refresh_display_name(&mut session);
-        assert_eq!(session.display_name, "index name");
-
-        session.indexed_name = None;
-        refresh_display_name(&mut session);
         assert_eq!(session.display_name, "state title");
 
         session.state_title = None;
+        refresh_display_name(&mut session);
+        assert_eq!(session.display_name, "index name");
+
+        session.indexed_name = None;
         refresh_display_name(&mut session);
         assert_eq!(session.display_name, "derived name");
 
@@ -1529,5 +1829,270 @@ mod tests {
     fn parse_pick_selection_rejects_out_of_range_values() {
         let error = parse_pick_selection("1 9", 8).unwrap_err().to_string();
         assert!(error.contains("out of range"));
+    }
+
+    #[test]
+    fn load_sessions_ignores_history_and_index_entries_without_real_sessions() {
+        let root = unique_test_dir("load-sessions-real-only");
+        fs::create_dir_all(root.join("sessions/2026/04/28")).unwrap();
+        write_rollout(
+            &root,
+            "sessions/2026/04/28/rollout-2026-04-28T12-00-00-real.jsonl",
+            "real",
+            "/tmp/real",
+        );
+        fs::write(
+            root.join("session_index.jsonl"),
+            "{\"id\":\"ghost\",\"thread_name\":\"ghost name\",\"updated_at\":\"2026-04-28T12:00:00Z\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("history.jsonl"),
+            "{\"session_id\":\"ghost\",\"ts\":1777387200,\"text\":\"ghost history\"}\n",
+        )
+        .unwrap();
+
+        let store = Store::new(Some(root.clone())).unwrap();
+        let sessions = store.load_sessions().unwrap();
+        let ids: Vec<String> = sessions.into_iter().map(|session| session.id).collect();
+        assert_eq!(ids, vec!["real".to_string()]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_sessions_includes_archived_rollouts() {
+        let root = unique_test_dir("load-archived-rollouts");
+        fs::create_dir_all(root.join("archived_sessions/2026/04/28")).unwrap();
+        write_rollout(
+            &root,
+            "archived_sessions/2026/04/28/rollout-2026-04-28T12-00-00-archived.jsonl",
+            "archived",
+            "/tmp/archived",
+        );
+
+        let store = Store::new(Some(root.clone())).unwrap();
+        let sessions = store.load_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "archived");
+        assert!(sessions[0].archived);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_sessions_prefers_state_db_title_over_legacy_index_name() {
+        let root = unique_test_dir("title-priority");
+        let rollout_path =
+            root.join("sessions/2026/04/28/rollout-2026-04-28T12-00-00-thread-1.jsonl");
+        write_rollout(
+            &root,
+            "sessions/2026/04/28/rollout-2026-04-28T12-00-00-thread-1.jsonl",
+            "thread-1",
+            "/tmp/thread-1",
+        );
+        init_state_db(&root);
+        let connection = Connection::open(root.join("state_5.sqlite")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, tokens_used, has_user_event, archived, cli_version,
+                first_user_message, memory_mode
+             ) VALUES (?1, ?2, 1, 2, 'cli', 'openai', '/tmp/thread-1', 'state title',
+                       '{}', 'never', 0, 0, 0, '0.125.0', 'first message', 'enabled')",
+                rusqlite::params!["thread-1", rollout_path.display().to_string()],
+            )
+            .unwrap();
+        fs::write(
+            root.join("session_index.jsonl"),
+            "{\"id\":\"thread-1\",\"thread_name\":\"legacy title\",\"updated_at\":\"2026-04-28T12:00:00Z\"}\n",
+        ).unwrap();
+
+        let store = Store::new(Some(root.clone())).unwrap();
+        let sessions = store.load_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].display_name, "state title");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_ids_removes_archived_rollouts_and_spawn_edges() {
+        let root = unique_test_dir("clean-archived-and-spawn-edges");
+        let archived_rollout =
+            "archived_sessions/2026/04/28/rollout-2026-04-28T12-00-00-child.jsonl";
+        write_rollout(&root, archived_rollout, "child", "/tmp/child");
+        init_state_db(&root);
+        let db_path = root.join("state_5.sqlite");
+        let connection = Connection::open(&db_path).unwrap();
+        let rollout_path = root.join(archived_rollout).display().to_string();
+        connection
+            .execute(
+                "INSERT INTO threads (
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, tokens_used, has_user_event, archived, cli_version,
+                first_user_message, memory_mode
+             ) VALUES (?1, ?2, 1, 2, 'cli', 'openai', '/tmp/child', 'child title',
+                       '{}', 'never', 0, 0, 1, '0.125.0', 'child message', 'enabled')",
+                rusqlite::params!["child", rollout_path],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status)
+             VALUES ('parent', 'child', 'active')",
+                [],
+            )
+            .unwrap();
+
+        let store = Store::new(Some(root.clone())).unwrap();
+        store.clean_ids(&["child".to_string()], true).unwrap();
+
+        assert!(!root.join(archived_rollout).exists());
+        let connection = Connection::open(&db_path).unwrap();
+        let remaining_threads: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_threads, 0);
+        let remaining_edges: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM thread_spawn_edges WHERE child_thread_id = 'child' OR parent_thread_id = 'child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_edges, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_session_scope_uses_parent_directory_for_files() {
+        let root = unique_test_dir("scope-from-file");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+
+        let scope = resolve_session_scope(&repo.join("src/lib.rs")).unwrap();
+        assert_eq!(
+            scope,
+            SessionScope {
+                mode: SessionScopeMode::ProjectRoot(fs::canonicalize(&repo).unwrap())
+            }
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_scope_matches_repo_and_nested_worktree_paths() {
+        let root = unique_test_dir("scope-match");
+        let repo = root.join("repo");
+        let nested = repo.join("subdir");
+        let sibling = root.join("other");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let tracked_file = nested.join("file.rs");
+        fs::write(&tracked_file, "fn main() {}\n").unwrap();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+
+        let scope = resolve_session_scope(&repo).unwrap();
+        let file_scope = resolve_session_scope(&tracked_file).unwrap();
+        let repo_session = SessionInfo {
+            id: "repo".to_string(),
+            paths: Vec::new(),
+            primary_rollout_path: None,
+            cwd: repo.clone(),
+            timestamp: None,
+            in_resume: false,
+            archived: false,
+            indexed_name: None,
+            state_title: None,
+            derived_name: None,
+            display_name: "repo".to_string(),
+            source: None,
+            model_provider: None,
+            cli_version: None,
+            sandbox_policy: None,
+            approval_mode: None,
+            first_user_message: None,
+        };
+        let nested_session = SessionInfo {
+            id: "nested".to_string(),
+            cwd: nested.clone(),
+            display_name: "nested".to_string(),
+            ..repo_session.clone()
+        };
+        let sibling_session = SessionInfo {
+            id: "sibling".to_string(),
+            cwd: sibling.clone(),
+            display_name: "sibling".to_string(),
+            ..repo_session.clone()
+        };
+
+        assert!(session_matches_scope(Some(&scope), &nested_session));
+        assert!(session_matches_scope(Some(&file_scope), &repo_session));
+        assert!(!session_matches_scope(Some(&scope), &sibling_session));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_session_scope_rejects_non_project_roots() {
+        let root = unique_test_dir("scope-rejects-wide-dir");
+        fs::create_dir_all(&root).unwrap();
+
+        let scope = resolve_session_scope(&root).unwrap();
+        assert_eq!(
+            scope,
+            SessionScope {
+                mode: SessionScopeMode::ExactDirectory(fs::canonicalize(&root).unwrap())
+            }
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_session_scope_treats_home_like_exact_directory_even_with_dot_codex() {
+        let root = unique_test_dir("scope-rejects-home");
+        let home = root.join("home");
+        let project = home.join("project");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::create_dir_all(project.join(".git")).unwrap();
+
+        let original_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", &home);
+        }
+
+        let home_scope = resolve_session_scope(&home).unwrap();
+        assert_eq!(
+            home_scope,
+            SessionScope {
+                mode: SessionScopeMode::ExactDirectory(fs::canonicalize(&home).unwrap())
+            }
+        );
+
+        let scope = resolve_session_scope(&project).unwrap();
+        assert_eq!(
+            scope,
+            SessionScope {
+                mode: SessionScopeMode::ProjectRoot(fs::canonicalize(&project).unwrap())
+            }
+        );
+
+        match original_home {
+            Some(value) => unsafe { env::set_var("HOME", value) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
